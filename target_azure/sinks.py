@@ -164,10 +164,6 @@ class TargetAzureBlobSink(RecordSink):
         self.logger.info(f"Writing {len(self.records_buffer)} buffered records to {self.local_file_path} as {self.output_format.upper()}")
 
         if self.output_format == "parquet":
-            if not PYARROW_AVAILABLE:
-                self.logger.error("Cannot write Parquet: pyarrow is not available.")
-                # Should have been caught in start_stream, but double check
-                raise RuntimeError("Pyarrow is required for Parquet output but not installed.")
             try:
                 # Write in binary mode for Parquet
                 with open(self.local_file_path, 'wb') as f:
