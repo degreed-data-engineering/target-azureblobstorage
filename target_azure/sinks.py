@@ -141,51 +141,104 @@ class TargetAzureBlobSink(RecordSink):
 
     def finalize_buffered_data(self):
         """Writes buffered data to local file for Parquet or JSONL."""
-        if not self.records_buffer:
-            self.logger.info(f"No records buffered for {self.stream_name}, nothing to write to {self.local_file_path}.")
-            # Ensure an empty file is created if no records, so upload doesn't fail with "file not found"
-            # For Parquet, an empty file with schema is valid. For JSONL, an empty file is also fine.
-            if not os.path.exists(self.local_file_path):
-                 with open(self.local_file_path, 'wb') as f: # Open in binary for parquet
-                    if self.output_format == "parquet":
-                        # Create an empty DataFrame to write schema-only Parquet if needed
-                        # This requires knowing the schema. For now, let's just make an empty file.
-                        # A better approach would be to get schema from self.schema
-                        # df_empty = pd.DataFrame(columns=list(self.schema["properties"].keys()))
-                        # df_empty.to_parquet(f, index=False, engine='pyarrow')
-                        pass # Empty binary file for now if no records
-                    # For JSONL, an empty text file is fine.
-                    elif self.output_format == "jsonl":
-                         pass # Empty text file is fine
+        self.logger.info(f"Entering finalize_buffered_data. Record count: {len(self.records_buffer)}. Local file path: {self.local_file_path}") # NEW LOG
 
+        if not self.records_buffer:
+            self.logger.info(f"No records buffered for {self.stream_name}, attempting to write empty file to {self.local_file_path}.")
+            if not os.path.exists(self.local_file_path):
+                 with open(self.local_file_path, 'wb') as f:
+                    if self.output_format == "parquet":
+                        self.logger.debug(f"Writing empty schema-only parquet file to {self.local_file_path}.")
+                        # Create an empty DataFrame WITH SCHEMA if possible, else just empty
+                        # schema_cols = list(self.schema["properties"].keys()) if self.schema and "properties" in self.schema else []
+                        # df_empty = pd.DataFrame(columns=schema_cols)
+                        df_empty = pd.DataFrame() # Simplest empty Parquet
+                        df_empty.to_parquet(f, index=False, engine='pyarrow')
+                    elif self.output_format == "jsonl":
+                         self.logger.debug(f"Writing empty JSONL file to {self.local_file_path}.")
+                         pass # Empty file is fine
+            else:
+                self.logger.info(f"Local file {self.local_file_path} already exists (empty records case). Doing nothing to it here.")
             return
 
-        df = pd.DataFrame(self.records_buffer)
+        # If records were buffered:
+        df = pd.DataFrame(self.records_buffer) # This line could fail if records_buffer contains problematic data for DataFrame creation
         self.logger.info(f"Writing {len(self.records_buffer)} buffered records to {self.local_file_path} as {self.output_format.upper()}")
 
         if self.output_format == "parquet":
             try:
-                # Write in binary mode for Parquet
+                self.logger.debug(f"Attempting to write Parquet data to {self.local_file_path}")
                 with open(self.local_file_path, 'wb') as f:
                     df.to_parquet(f, index=False, engine='pyarrow')
-                self.logger.debug(f"Successfully wrote Parquet to {self.local_file_path}")
+                self.logger.info(f"Successfully wrote Parquet data to {self.local_file_path}. File size: {os.path.getsize(self.local_file_path)} bytes.") # NEW LOG
             except Exception as e:
-                self.logger.error(f"Error writing Parquet file {self.local_file_path}: {e}")
+                self.logger.error(f"Error writing Parquet file {self.local_file_path}: {e}", exc_info=True) # Add exc_info
                 raise
         elif self.output_format == "jsonl":
             try:
-                # Write in append text mode for JSONL
-                with open(self.local_file_path, 'w', encoding='utf-8') as f: # 'w' to overwrite if called multiple times (though finalize is once)
-                    for record in self.records_buffer:
-                        import json # Make sure json is imported
-                        f.write(json.dumps(record) + '\n')
-                self.logger.debug(f"Successfully wrote JSONL to {self.local_file_path}")
+                self.logger.debug(f"Attempting to write JSONL data to {self.local_file_path}")
+                with open(self.local_file_path, 'w', encoding='utf-8') as f:
+                    for record_item in self.records_buffer: # Renamed to avoid conflict
+                        import json
+                        f.write(json.dumps(record_item) + '\n')
+                self.logger.info(f"Successfully wrote JSONL data to {self.local_file_path}. File size: {os.path.getsize(self.local_file_path)} bytes.") # NEW LOG
             except Exception as e:
-                self.logger.error(f"Error writing JSONL file {self.local_file_path}: {e}")
+                self.logger.error(f"Error writing JSONL file {self.local_file_path}: {e}", exc_info=True) # Add exc_info
                 raise
         
-        self.records_buffer = [] # Clear buffer
+        self.records_buffer = []
 
+
+    def clean_up(self) -> None:
+        self.logger.info(f"Starting clean_up for stream {self.stream_name}. Stream initialized: {self.stream_initialized}. Local file path: {self.local_file_path}. Output format: {self.output_format}") # NEW LOG
+
+        if not self.stream_initialized:
+            self.logger.warning(f"Stream {self.stream_name} was not initialized. Skipping clean_up actions.")
+            return
+
+        if self.output_format in ["parquet", "jsonl"]:
+            self.logger.debug("Calling finalize_buffered_data()")
+            self.finalize_buffered_data()
+            self.logger.debug("Returned from finalize_buffered_data()")
+
+
+        if not self.local_file_path:
+            self.logger.error("local_file_path is None during clean_up after finalize_buffered_data. This should not happen.")
+            return
+
+        self.logger.info(f"Post finalize_buffered_data: Checking existence of local file: {self.local_file_path}") # NEW LOG
+
+        try:
+            if not os.path.exists(self.local_file_path):
+                self.logger.warning(f"Local file {self.local_file_path} does not exist after finalize_buffered_data. Skipping upload for {self.blob_path}.")
+                return
+            
+            file_size = os.path.getsize(self.local_file_path)
+            if file_size == 0:
+                self.logger.info(f"Local file {self.local_file_path} is empty (0 bytes). Proceeding with upload of empty file to {self.blob_path}.")
+                # Decide if you want to upload genuinely empty files or skip.
+                # For now, let's upload it.
+            else:
+                self.logger.info(f"Local file {self.local_file_path} exists. Size: {file_size} bytes.")
+
+
+            self.logger.debug(f"Preparing to upload {self.local_file_path} (as {self.output_format.upper()}) to Azure Blob Storage path: {self.blob_path}")
+            with open(self.local_file_path, "rb") as data:
+                self.blob_client.upload_blob(data, overwrite=True) # Ensure self.blob_client is valid
+            self.logger.info(f"Successfully uploaded {self.blob_path} to Azure Blob Storage")
+        except Exception as e:
+            self.logger.error(f"Failed during upload or pre-upload check for {self.blob_path}: {e}", exc_info=True) # Add exc_info
+            # Decide on re-raise. If clean_up is the very last step, maybe just log.
+            # If the SDK expects clean_up to raise on failure, then do:
+            # raise
+        finally:
+            # ... (cleanup of local file)
+            if self.local_file_path and os.path.exists(self.local_file_path):
+                try:
+                    os.remove(self.local_file_path)
+                    self.logger.debug(f"Removed local file: {self.local_file_path}")
+                except Exception as e:
+                    self.logger.error(f"Error removing local file {self.local_file_path}: {e}", exc_info=True)
 
     def finalize(self) -> None:
         """Upload the local file to Azure Blob Storage and remove it."""
