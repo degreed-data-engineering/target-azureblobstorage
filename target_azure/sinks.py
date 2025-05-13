@@ -7,7 +7,7 @@ import logging
 import pyarrow
 from azure.core.exceptions import ResourceExistsError
 from datetime import datetime
-import atexit
+# import atexit
 
 class TargetAzureBlobSink(RecordSink):
     """Azure Storage target sink class for streaming."""
@@ -21,7 +21,7 @@ class TargetAzureBlobSink(RecordSink):
         self.stream_initialized = False
         self.output_format = "csv" # Default output format
         self.logger.setLevel(logging.DEBUG)
-        atexit.register(self.finalize) # Be careful with atexit in long-running or complex apps
+        # atexit.register(self.finalize) # Be careful with atexit in long-running or complex apps
 
     def get_output_format_from_filename(self, filename: str) -> str:
         """Determines the output format based on the file extension."""
