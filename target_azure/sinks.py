@@ -6,13 +6,13 @@ import re
 import logging
 import pyarrow
 import pyarrow.parquet as pq
-import pyarrow.types # Import pyarrow.types explicitly
+import pyarrow.types 
 import json
 from azure.core.exceptions import ResourceExistsError
-from datetime import datetime, date # Import date for type checking
+from datetime import datetime, date 
 import uuid
-from decimal import Decimal, InvalidOperation
-from typing import Optional, Union, Dict, Any
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP 
+from typing import Optional, Union, Dict, Any 
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +20,8 @@ class TargetAzureBlobSink(RecordSink):
     """Azure Storage target sink class for streaming with batching."""
 
     DEFAULT_BATCH_SIZE_ROWS = 10000
-    DEFAULT_DECIMAL_PRECISION = 38
-    DEFAULT_DECIMAL_SCALE = 9
+    DEFAULT_DECIMAL_PRECISION = 38 
+    DEFAULT_DECIMAL_SCALE = 9      
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -70,10 +70,7 @@ class TargetAzureBlobSink(RecordSink):
         singer_types = singer_type_def.get("type", ["null", "string"])
         
         if "number" in singer_types:
-            if self.stream_name == "public-Licenses" and property_name == "InternalCost":
-                # IMPORTANT: Verify and set correct precision and scale for InternalCost
-                return pyarrow.decimal128(precision=18, scale=4) # EXAMPLE - ADJUST THIS!
-            return pyarrow.decimal128(self.DEFAULT_DECIMAL_PRECISION, self.DEFAULT_DECIMAL_SCALE)
+                return pyarrow.decimal128(self.DEFAULT_DECIMAL_PRECISION, self.DEFAULT_DECIMAL_SCALE)
         elif "integer" in singer_types:
             return pyarrow.int64()
         elif "boolean" in singer_types:
@@ -90,12 +87,12 @@ class TargetAzureBlobSink(RecordSink):
             pa_item_type = self._singer_type_to_pyarrow_type(item_type_def, f"{property_name}_items")
             if pa_item_type:
                 return pyarrow.list_(pa_item_type)
-            self.logger.warning(f"Could not determine item type for array '{property_name}'. Defaulting array items to string.")
+            # self.logger.warning(f"Could not determine item type for array '{property_name}'. Defaulting array items to string.") # Commented out
             return pyarrow.list_(pyarrow.string())
         elif "object" in singer_types:
             return pyarrow.string()
 
-        self.logger.warning(f"Unknown Singer type(s) {singer_types} for property '{property_name}'. Defaulting to string.")
+        # self.logger.warning(f"Unknown Singer type(s) {singer_types} for property '{property_name}'. Defaulting to string.") # Commented out
         return pyarrow.string()
 
     def _build_pyarrow_schema(self) -> Optional[pyarrow.Schema]:
@@ -132,15 +129,14 @@ class TargetAzureBlobSink(RecordSink):
         )
 
         self.blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-        if self.blob_service_client : # Make sure client was created
+        if self.blob_service_client:
             self.container_client = self.blob_service_client.get_container_client(container_name)
         else:
             self.logger.critical("Failed to create BlobServiceClient.")
             raise ConnectionError("Failed to create BlobServiceClient.")
 
-
         try:
-            if self.container_client: # Make sure container_client is not None
+            if self.container_client:
                 self.container_client.create_container()
                 self.logger.info(f"Created container: {container_name}")
         except ResourceExistsError:
@@ -183,12 +179,27 @@ class TargetAzureBlobSink(RecordSink):
                 continue
 
             try:
-                if pyarrow.types.is_decimal(pa_type): # FIXED
-                    coerced_record[col_name] = Decimal(str(raw_value))
-                elif pyarrow.types.is_timestamp(pa_type): # FIXED
+                if pyarrow.types.is_decimal(pa_type):
+                    str_val = str(raw_value).strip()
+                    if not str_val: # Handle empty string as None
+                        coerced_record[col_name] = None
+                    else:
+                        try:
+                            original_decimal = Decimal(str_val)
+                            target_scale = pa_type.scale 
+                            quantizer = Decimal('1e-' + str(target_scale))
+                            coerced_decimal = original_decimal.quantize(quantizer, rounding=ROUND_HALF_UP)
+                            coerced_record[col_name] = coerced_decimal
+                        except InvalidOperation:
+                            # self.logger.warning(f"Invalid operation converting '{raw_value}' to Decimal for column '{col_name}'. Setting to None.")
+                            coerced_record[col_name] = None
+                elif pyarrow.types.is_timestamp(pa_type):
+                    # Handle '0002-12-31...' by trying to parse, will become NaT if invalid
                     dt_val = pd.to_datetime(raw_value, errors='coerce', utc=False)
                     if pd.isna(dt_val):
-                        self.logger.warning(f"Could not parse timestamp '{raw_value}' for column '{col_name}'. Setting to None.")
+                        # Log for "0002..." was here, now commented out
+                        # if str(raw_value).startswith("0002"):
+                        #     self.logger.debug(f"Coerced problematic timestamp '{raw_value}' for column '{col_name}' to None.")
                         coerced_record[col_name] = None
                     else:
                         if pa_type.tz:
@@ -198,26 +209,26 @@ class TargetAzureBlobSink(RecordSink):
                                  coerced_record[col_name] = dt_val.tz_convert(pa_type.tz)
                         else:
                              coerced_record[col_name] = dt_val.tz_localize(None) if dt_val.tzinfo else dt_val
-                elif pyarrow.types.is_date(pa_type): # FIXED (catches date32 and date64)
+                elif pyarrow.types.is_date(pa_type):
                     dt_obj = pd.to_datetime(raw_value, errors='coerce')
-                    # Check if dt_obj is NaT (Not a Time) which is pandas' null for datetime
                     coerced_record[col_name] = dt_obj.date() if pd.notna(dt_obj) else None
-                    if coerced_record[col_name] is None and raw_value is not None: # Log only if original value was not None
-                         self.logger.warning(f"Could not parse date '{raw_value}' for column '{col_name}'. Setting to None.")
-                elif pyarrow.types.is_integer(pa_type): # FIXED
+                    # if coerced_record[col_name] is None and raw_value is not None:
+                    #      pass # self.logger.warning(f"Could not parse date '{raw_value}' for column '{col_name}'. Setting to None.")
+                elif pyarrow.types.is_integer(pa_type):
                     coerced_record[col_name] = int(float(str(raw_value)))
-                elif pyarrow.types.is_floating(pa_type): # FIXED
+                elif pyarrow.types.is_floating(pa_type):
                     coerced_record[col_name] = float(str(raw_value))
-                elif pyarrow.types.is_boolean(pa_type): # FIXED
+                elif pyarrow.types.is_boolean(pa_type):
                     if isinstance(raw_value, str):
-                        if raw_value.lower() in ("true", "t", "1", "yes", "y"): coerced_record[col_name] = True
-                        elif raw_value.lower() in ("false", "f", "0", "no", "n"): coerced_record[col_name] = False
+                        val_lower = raw_value.lower()
+                        if val_lower in ("true", "t", "1", "yes", "y"): coerced_record[col_name] = True
+                        elif val_lower in ("false", "f", "0", "no", "n"): coerced_record[col_name] = False
                         else: 
-                            self.logger.warning(f"Could not parse boolean string '{raw_value}' for column '{col_name}'. Setting to None.")
+                            # self.logger.warning(f"Could not parse boolean string '{raw_value}' for column '{col_name}'. Setting to None.")
                             coerced_record[col_name] = None
                     else:
                         coerced_record[col_name] = bool(raw_value)
-                elif pyarrow.types.is_string(pa_type) or pyarrow.types.is_large_string(pa_type): # FIXED
+                elif pyarrow.types.is_string(pa_type) or pyarrow.types.is_large_string(pa_type):
                     if isinstance(raw_value, (dict, list)):
                         coerced_record[col_name] = json.dumps(raw_value)
                     else:
@@ -225,15 +236,15 @@ class TargetAzureBlobSink(RecordSink):
                 else:
                     coerced_record[col_name] = raw_value
             except (ValueError, TypeError, InvalidOperation, OverflowError) as e:
-                self.logger.warning(
-                    f"Type coercion error for column '{col_name}' with value '{raw_value}' "
-                    f"(expected PyArrow type {pa_type}): {e}. Setting to None."
-                )
+                # self.logger.warning(
+                #     f"Type coercion error for column '{col_name}' with value '{raw_value}' "
+                #     f"(expected PyArrow type {pa_type}): {e}. Setting to None."
+                # )
                 coerced_record[col_name] = None
         
         for col_name, raw_value in record.items():
             if col_name not in coerced_record:
-                self.logger.debug(f"Column '{col_name}' found in record but not in PyArrow schema. Adding as best-effort string.")
+                # self.logger.debug(f"Column '{col_name}' found in record but not in PyArrow schema. Adding as best-effort string.") # Can be verbose
                 if isinstance(raw_value, (dict,list)):
                     try:
                         coerced_record[col_name] = json.dumps(raw_value)
@@ -275,8 +286,8 @@ class TargetAzureBlobSink(RecordSink):
 
             if self.output_format == "parquet":
                 if not self._pyarrow_schema:
-                    self.logger.error(f"PyArrow schema is None in _drain_batch for Parquet on stream {self.stream_name}.")
-                    self._pyarrow_schema = self._build_pyarrow_schema() # Attempt to rebuild
+                    self.logger.error(f"PyArrow schema is None in _drain_batch for Parquet on stream {self.stream_name}. This indicates an earlier failure.")
+                    self._pyarrow_schema = self._build_pyarrow_schema()
                     if not self._pyarrow_schema:
                          raise ValueError(f"Cannot write Parquet for {self.stream_name} without a PyArrow schema.")
 
@@ -285,23 +296,17 @@ class TargetAzureBlobSink(RecordSink):
                     if field.name in df.columns:
                         data_for_arrow[field.name] = df[field.name]
                     else:
-                        self.logger.debug(f"Column '{field.name}' from schema not in DataFrame batch for {self.stream_name}. Adding as nulls.")
-                        # Ensure correct dtype for None series for pyarrow conversion
-                        if pyarrow.types.is_timestamp(field.type):
-                            pd_dtype = 'datetime64[ns]'
-                        elif pyarrow.types.is_boolean(field.type):
-                             pd_dtype = 'boolean' # Pandas nullable boolean
-                        elif pyarrow.types.is_integer(field.type):
-                             pd_dtype = 'Int64' # Pandas nullable integer
-                        elif pyarrow.types.is_floating(field.type) or pyarrow.types.is_decimal(field.type):
-                             pd_dtype = 'float64' # Pandas float handles NaN well for these
-                        else:
-                             pd_dtype = 'object'
+                        # self.logger.debug(f"Column '{field.name}' from schema not in DataFrame batch for {self.stream_name}. Adding as nulls.") # Can be verbose
+                        pd_dtype = 'object'
+                        if pyarrow.types.is_timestamp(field.type): pd_dtype = 'datetime64[ns]'
+                        elif pyarrow.types.is_boolean(field.type): pd_dtype = 'boolean'
+                        elif pyarrow.types.is_integer(field.type): pd_dtype = 'Int64'
+                        elif pyarrow.types.is_floating(field.type) or pyarrow.types.is_decimal(field.type): pd_dtype = 'float64'
                         data_for_arrow[field.name] = pd.Series([None] * len(df), dtype=pd_dtype, name=field.name)
                 
                 df_aligned = pd.DataFrame(data_for_arrow, columns=[field.name for field in self._pyarrow_schema])
                 
-                arrow_table = pyarrow.Table.from_pandas(df_aligned, schema=self._pyarrow_schema, safe=True)
+                arrow_table = pyarrow.Table.from_pandas(df_aligned, schema=self._pyarrow_schema, safe=True, preserve_index=False)
                 with open(current_local_batch_file, 'wb') as f:
                     pq.write_table(arrow_table, f)
 
@@ -317,7 +322,7 @@ class TargetAzureBlobSink(RecordSink):
             file_size = os.path.getsize(current_local_batch_file)
             self.logger.info(f"Successfully wrote batch to {current_local_batch_file}. Size: {file_size} bytes. Uploading to {current_batch_blob_path}.")
 
-            if self.container_client: # Ensure container_client is initialized
+            if self.container_client:
                 blob_client_for_batch = self.container_client.get_blob_client(blob=current_batch_blob_path)
                 with open(current_local_batch_file, "rb") as data:
                     blob_client_for_batch.upload_blob(data, overwrite=True)
@@ -325,7 +330,6 @@ class TargetAzureBlobSink(RecordSink):
             else:
                 self.logger.error("Container client not initialized, cannot upload batch.")
                 raise ConnectionError("Azure container client not initialized.")
-
 
         except Exception as e:
             self.logger.error(f"Failed to process or upload batch for {self.stream_name} to {current_batch_blob_path}: {e}", exc_info=True)
@@ -344,14 +348,12 @@ class TargetAzureBlobSink(RecordSink):
     def _serialize_json_safe(self, record: Dict[str, Any]) -> Dict[str, Any]:
         safe_record: Dict[str, Any] = {}
         for key, value in record.items():
-            if isinstance(value, (datetime, pd.Timestamp, date)): # Added date
+            if isinstance(value, (datetime, pd.Timestamp, date)):
                 safe_record[key] = value.isoformat()
             elif isinstance(value, Decimal):
                 safe_record[key] = float(value) 
             elif pd.isna(value):
                 safe_record[key] = None
-            elif isinstance(value, (float)) and (value != value): # Check for float NaN
-                 safe_record[key] = None
             else:
                 safe_record[key] = value
         return safe_record
