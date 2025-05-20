@@ -1,43 +1,74 @@
 import os
 import pandas as pd
-from singer_sdk.sinks import RecordSink
-from azure.storage.blob import BlobServiceClient # Removed BlobClient as get_blob_client returns it
+from singer_sdk.sinks import RecordSink # Changed from core to sinks for modern SDK
+from azure.storage.blob import BlobServiceClient
 import re
 import logging
-import pyarrow
+import pyarrow # Ensure pyarrow is installed for Parquet
+import json # For JSONL
 from azure.core.exceptions import ResourceExistsError
 from datetime import datetime
-# import atexit
+import uuid # For unique batch file names
+
+logger = logging.getLogger(__name__) # Use standard Python logging
 
 class TargetAzureBlobSink(RecordSink):
-    """Azure Storage target sink class for streaming."""
+    """Azure Storage target sink class for streaming with batching."""
+
+    # Define a default batch size, can be overridden in config
+    DEFAULT_BATCH_SIZE_ROWS = 10000
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.blob_service_client = None
         self.container_client = None
-        self.blob_client = None
-        self.local_file_path = None
+        # self.blob_client is now set per batch file
+        self.local_file_path_template = None # Template for local files if needed for multiple batches
+        self.blob_path_template = None # Template for blob paths if needed for multiple batches
         self.stream_initialized = False
-        self.output_format = "csv" # Default output format
-        self.logger.setLevel(logging.DEBUG)
-        # atexit.register(self.finalize) # Be careful with atexit in long-running or complex apps
+        self.output_format = "csv" # Default, will be updated
+        # self.logger is already available from the parent class
+        self.records_buffer = []
+        self.batch_file_counter = 0 # To create unique names for batch files
+
+    @property
+    def batch_size_rows(self) -> int:
+        return int(self.config.get("batch_size_rows", self.DEFAULT_BATCH_SIZE_ROWS))
 
     def get_output_format_from_filename(self, filename: str) -> str:
-        """Determines the output format based on the file extension."""
         if filename.lower().endswith(".parquet"):
             return "parquet"
-        elif filename.lower().endswith(".jsonl") or filename.lower().endswith(".json"): # Treat .json as jsonl for simplicity here
+        elif filename.lower().endswith(".jsonl") or filename.lower().endswith(".json"):
             return "jsonl"
-        # Add other formats like .json if you want to support standard JSON arrays later
-        return "csv" # Default to CSV
+        return "csv"
 
-    def start_stream(self) -> None:
-        """Initialize the stream."""
+    def _generate_batch_suffix(self) -> str:
+        """Generates a unique suffix for batch files."""
+        return f"part_{self.batch_file_counter:04d}_{uuid.uuid4().hex[:8]}"
+
+    def _get_batch_blob_path(self) -> str:
+        """Generates the full blob path for the current batch."""
+        if self.output_format == "csv": # CSV still appends to one file
+            return self.blob_path_template
+
+        base_path, extension = os.path.splitext(self.blob_path_template)
+        batch_suffix = self._generate_batch_suffix()
+        return f"{base_path}_{batch_suffix}{extension}"
+
+    def _get_batch_local_file_path(self, batch_blob_path: str) -> str:
+        """Generates a local temporary path for the current batch file."""
+        # Use a subdirectory within /tmp to keep things organized per stream if many files are created
+        stream_tmp_dir = os.path.join("/tmp", f"target_azure_{self.stream_name}")
+        os.makedirs(stream_tmp_dir, exist_ok=True)
+        return os.path.join(stream_tmp_dir, os.path.basename(batch_blob_path))
+
+
+    def start_stream(self, context: dict) -> None: # context is passed by SDK
+        """Initialize the stream (called by SDK)."""
         self.logger.info(f"Starting stream for {self.stream_name}")
         account_name = self.config["storage_account_name"]
         account_key = self.config["storage_account_key"]
-        container_name = self.config.get("container_name", "default-container")
+        container_name = self.config.get("container_name", "default-container") # Use actual config key
         connection_string = self.config.get(
             "azure_storage_connection_string",
             f"DefaultEndpointsProtocol=https;AccountName={account_name};AccountKey={account_key};EndpointSuffix=core.windows.net"
@@ -51,248 +82,197 @@ class TargetAzureBlobSink(RecordSink):
             self.logger.info(f"Created container: {container_name}")
         except ResourceExistsError:
             self.logger.info(f"Container {container_name} already exists.")
+        except Exception as e:
+            self.logger.error(f"Failed to create or access container {container_name}: {e}", exc_info=True)
+            raise # Fail fast if container can't be accessed
 
-        file_name_with_path = self.format_file_name() # This now includes the full desired blob path
-        self.output_format = self.get_output_format_from_filename(file_name_with_path)
+        # This template will be used as a base for batch files or the single CSV file
+        self.blob_path_template = self.format_file_name()
+        self.output_format = self.get_output_format_from_filename(self.blob_path_template)
 
-        self.blob_path = file_name_with_path # format_file_name now returns the full path
-        self.local_file_path = os.path.join("/tmp", os.path.basename(file_name_with_path)) # Use only basename for local temp file
-        os.makedirs(os.path.dirname(self.local_file_path), exist_ok=True)
-
-        # For Parquet, we don't create an empty file initially like for CSV appending.
-        # For JSONL, we also don't need an empty file to start, each line is a new object.
-        # For CSV, the original logic is fine.
         if self.output_format == "csv":
-            if not os.path.exists(self.local_file_path):
-                with open(self.local_file_path, 'w') as f: # For CSV, ensure it's writable text mode
-                    f.write('')
-        elif os.path.exists(self.local_file_path): # If not CSV and file exists from previous run (should not happen with /tmp typically)
-            os.remove(self.local_file_path)
-
-        self.blob_client = self.container_client.get_blob_client(blob=self.blob_path)
-        self.logger.debug(f"Initialized blob client for: {self.blob_path}. Output format: {self.output_format.upper()}")
+            # For CSV, we use a single local file to append to, then upload at the end.
+            # Batching for CSV to multiple files is also possible but changes the append logic.
+            # For now, keeping CSV as a single upload.
+            self.local_file_path_template = os.path.join("/tmp", os.path.basename(self.blob_path_template))
+            os.makedirs(os.path.dirname(self.local_file_path_template), exist_ok=True)
+            if not os.path.exists(self.local_file_path_template):
+                with open(self.local_file_path_template, 'w', encoding='utf-8') as f:
+                    f.write('') # Create empty file
+        
+        self.logger.debug(f"Stream {self.stream_name} initialized. Output format: {self.output_format.upper()}. Batch size: {self.batch_size_rows} rows.")
         self.stream_initialized = True
-        self.records_buffer = [] # Buffer records for Parquet/JSONL
+        self.records_buffer = []
+        self.batch_file_counter = 0
+
 
     def process_record(self, record: dict, context: dict) -> None:
-        """Process and write the record."""
+        """Process record, buffering and flushing in batches for Parquet/JSONL."""
         if not self.stream_initialized:
-            self.start_stream()
+            # Should be called by SDK before process_record, but as a safeguard:
+            self.logger.warning("Stream not initialized in process_record, attempting to initialize.")
+            self.start_stream(context)
 
+        self.records_buffer.append(record)
 
         if self.output_format == "csv":
-            df = pd.DataFrame([record])
-            header = not os.path.exists(self.local_file_path) or os.path.getsize(self.local_file_path) == 0
-            # Open in append text mode for CSV
-            with open(self.local_file_path, 'a', newline='', encoding='utf-8') as f:
+            # For CSV, we write directly to the single local file by appending
+            # This part could also be batched, but it's simpler to append directly
+            # and then upload the single CSV at the end.
+            # For extreme CSVs, this might still cause /tmp issues if the CSV grows huge before upload.
+            # However, the primary memory issue is usually with Parquet/JSONL buffering.
+            df = pd.DataFrame([record]) # Create DataFrame for a single record
+            # Check if local_file_path_template exists and is empty to decide on header
+            header = not os.path.exists(self.local_file_path_template) or os.path.getsize(self.local_file_path_template) == 0
+            with open(self.local_file_path_template, 'a', newline='', encoding='utf-8') as f:
                 df.to_csv(f, index=False, header=header)
+            self.records_buffer = [] # Clear buffer since it's written for CSV
 
-        else:
-            # For Parquet and JSONL, buffer records and write in batches (or at the end)
-            self.records_buffer.append(record)
+        elif len(self.records_buffer) >= self.batch_size_rows:
+            self.logger.info(f"Buffer for {self.stream_name} reached {len(self.records_buffer)} records. Draining batch.")
+            self._drain_batch()
+
+
+    def _drain_batch(self) -> None:
+        """Writes the current records_buffer to a batch file and uploads it."""
+        if not self.records_buffer:
+            self.logger.debug(f"No records in buffer for {self.stream_name}, skipping batch drain.")
+            return
+
+        current_batch_blob_path = self._get_batch_blob_path()
+        current_local_batch_file = self._get_batch_local_file_path(current_batch_blob_path)
+        
+        self.logger.info(f"Draining {len(self.records_buffer)} records for {self.stream_name} to local file {current_local_batch_file} for blob {current_batch_blob_path}")
+
+        try:
+            if self.output_format == "parquet":
+                df = pd.DataFrame(self.records_buffer)
+                with open(current_local_batch_file, 'wb') as f:
+                    df.to_parquet(f, index=False, engine='pyarrow')
+            elif self.output_format == "jsonl":
+                with open(current_local_batch_file, 'w', encoding='utf-8') as f:
+                    for rec in self.records_buffer:
+                        f.write(json.dumps(rec) + '\n')
+            else: # Should not happen if logic is correct, but good to handle
+                self.logger.error(f"Unsupported format '{self.output_format}' in _drain_batch for {self.stream_name}.")
+                return # Or raise error
+
+            file_size = os.path.getsize(current_local_batch_file)
+            self.logger.info(f"Successfully wrote batch to {current_local_batch_file}. Size: {file_size} bytes. Uploading to {current_batch_blob_path}.")
+
+            blob_client_for_batch = self.container_client.get_blob_client(blob=current_batch_blob_path)
+            with open(current_local_batch_file, "rb") as data:
+                blob_client_for_batch.upload_blob(data, overwrite=True) # Consider if overwrite is always desired for batch parts
+            self.logger.info(f"Successfully uploaded batch file {current_batch_blob_path}")
+
+        except Exception as e:
+            self.logger.error(f"Failed to process or upload batch for {self.stream_name} to {current_batch_blob_path}: {e}", exc_info=True)
+            # Depending on error strategy, you might want to re-raise
+            raise
+        finally:
+            if os.path.exists(current_local_batch_file):
+                try:
+                    os.remove(current_local_batch_file)
+                    self.logger.debug(f"Removed local batch file: {current_local_batch_file}")
+                except Exception as e_rem:
+                    self.logger.error(f"Error removing local batch file {current_local_batch_file}: {e_rem}")
+            self.records_buffer = [] # Clear buffer after processing
+            self.batch_file_counter += 1
 
 
     def format_file_name(self) -> str:
-        """
-        Format the file name based on the context and Azure Blob Storage naming rules.
-        The naming_convention can now include path components.
-        Example: "my_subfolder/{stream}_{timestamp}.parquet"
-        """
-        # Default naming convention is now more generic until format is determined
-        naming_convention = self.config.get("naming_convention", "{stream}/data.csv")
-        stream_name = self.stream_name
-
-        # Basic timestamp for uniqueness if not in naming_convention
-        # More robust timestamping from singer_sdk.helpers._typing might be better
+        """Formats the base file name/path pattern for the stream."""
+        naming_convention = self.config.get("naming_convention", "{stream}/data_{timestamp}.csv") # Default includes timestamp for uniqueness if not batched
+        stream_name_safe = re.sub(r'[\\/*?:"<>|]', "_", self.stream_name) # Sanitize stream name for path
+        
         timestamp_str = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
 
-        # Simple replacement, consider more robust templating if needed
-        file_name_pattern = naming_convention.replace("{stream}", stream_name)
+        file_name_pattern = naming_convention.replace("{stream}", stream_name_safe)
         file_name_pattern = file_name_pattern.replace("{timestamp}", timestamp_str)
-        # Add other placeholders like {date}, {time} if you have them
-
-        # Replace or remove invalid characters for Azure Blob Storage (applies to path components too)
-        # This regex is a bit aggressive for path components; Azure allows '/'
-        # Let's refine it to only sanitize the actual filename part if '/' is a path separator
         
-        # Assume '/' is a path separator and should not be sanitized
-        # Sanitize each component if you want to be super careful, or just the basename
-        # For simplicity, we'll sanitize the whole thing but this might mangle desired subfolders
-        # if they contain invalid chars. Better to ensure naming_convention is clean.
-        # A more robust way would be to split by '/', sanitize each part except the last,
-        # then sanitize the last part (filename).
+        # Basic sanitization for the whole pattern. Users should ensure path components are valid.
+        # This is a simplification. For robust path sanitization, each component would be handled.
+        final_path = re.sub(r'[\\*?:"<>|]', "_", file_name_pattern)
+        # Ensure it doesn't start or end with '/' after sanitization if it's not intended
+        final_path = final_path.strip('/')
         
-        # Simplified: User must ensure path in naming_convention is valid. Sanitize only filename chars.
-        path_parts = file_name_pattern.split('/')
-        sanitized_parts = []
-        for i, part in enumerate(path_parts):
-            if i == len(path_parts) - 1: # Last part is the filename
-                 # Replace invalid characters for the filename part
-                sanitized_parts.append(re.sub(r'[\\*?:"<>|]', "_", part))
-            else: # Path components
-                # Path components can have different rules, but let's be safe
-                # Azure allows most chars in paths, but let's avoid these common ones too.
-                sanitized_parts.append(re.sub(r'[\\*?:"<>|]', "_", part))
-        
-        final_path = "/".join(sanitized_parts)
-
-        self.logger.debug(f"Formatted file name/path: {final_path}")
+        self.logger.debug(f"Formatted base file name/path pattern: {final_path}")
         return final_path
 
-    def finalize_buffered_data(self):
-        """Writes buffered data to local file for Parquet or JSONL."""
-        self.logger.info(f"Entering finalize_buffered_data. Record count: {len(self.records_buffer)}. Local file path: {self.local_file_path}") # NEW LOG
+    def clean_up(self) -> None: # Renamed from finalize to match SDK hook if not using atexit
+        """Finalize processing for the stream, uploading any remaining buffered data."""
+        self.logger.info(f"Starting clean_up for stream {self.stream_name}. Records in buffer: {len(self.records_buffer)}")
 
-        if not self.records_buffer:
-            self.logger.info(f"No records buffered for {self.stream_name}, attempting to write empty file to {self.local_file_path}.")
-            if not os.path.exists(self.local_file_path):
-                 with open(self.local_file_path, 'wb') as f:
-                    if self.output_format == "parquet":
-                        self.logger.debug(f"Writing empty schema-only parquet file to {self.local_file_path}.")
-                        # Create an empty DataFrame WITH SCHEMA if possible, else just empty
-                        # schema_cols = list(self.schema["properties"].keys()) if self.schema and "properties" in self.schema else []
-                        # df_empty = pd.DataFrame(columns=schema_cols)
-                        df_empty = pd.DataFrame() # Simplest empty Parquet
-                        df_empty.to_parquet(f, index=False, engine='pyarrow')
-                    elif self.output_format == "jsonl":
-                         self.logger.debug(f"Writing empty JSONL file to {self.local_file_path}.")
-                         pass # Empty file is fine
-            else:
-                self.logger.info(f"Local file {self.local_file_path} already exists (empty records case). Doing nothing to it here.")
+        if not self.stream_initialized:
+            self.logger.warning(f"Stream {self.stream_name} was not initialized. Skipping clean_up.")
             return
 
-        # If records were buffered:
-        df = pd.DataFrame(self.records_buffer) # This line could fail if records_buffer contains problematic data for DataFrame creation
-        self.logger.info(f"Writing {len(self.records_buffer)} buffered records to {self.local_file_path} as {self.output_format.upper()}")
+        # Drain any remaining records in the buffer for Parquet/JSONL
+        if self.output_format in ["parquet", "jsonl"]:
+            if self.records_buffer: # Only drain if there's something left
+                self.logger.info(f"Draining remaining {len(self.records_buffer)} records for {self.stream_name} during clean_up.")
+                self._drain_batch()
+            else:
+                # If no records were ever processed for this stream (or all flushed in batches),
+                # we might want to create an empty marker file in Azure.
+                # This part is optional and depends on desired behavior for empty streams.
+                # For now, if the buffer is empty, _drain_batch does nothing.
+                # To ensure an empty file is created if NO records were processed AT ALL for the stream:
+                if self.batch_file_counter == 0: # No batches were written yet
+                    self.logger.info(f"No records processed and no batches written for {self.stream_name}. Writing an empty marker file.")
+                    # Write an empty file (0 records)
+                    current_batch_blob_path = self._get_batch_blob_path() # Will use part_0000
+                    current_local_batch_file = self._get_batch_local_file_path(current_batch_blob_path)
+                    try:
+                        if self.output_format == "parquet":
+                            df_empty = pd.DataFrame()
+                            with open(current_local_batch_file, 'wb') as f:
+                                df_empty.to_parquet(f, index=False, engine='pyarrow')
+                        elif self.output_format == "jsonl":
+                            with open(current_local_batch_file, 'w', encoding='utf-8') as f:
+                                pass # Empty file is fine
+                        
+                        if os.path.exists(current_local_batch_file):
+                            blob_client_for_empty = self.container_client.get_blob_client(blob=current_batch_blob_path)
+                            with open(current_local_batch_file, "rb") as data:
+                                blob_client_for_empty.upload_blob(data, overwrite=True)
+                            self.logger.info(f"Successfully uploaded empty marker file {current_batch_blob_path}")
+                    except Exception as e:
+                         self.logger.error(f"Failed to create or upload empty marker file for {self.stream_name}: {e}", exc_info=True)
+                    finally:
+                        if os.path.exists(current_local_batch_file):
+                             try: os.remove(current_local_batch_file)
+                             except: pass
 
-        if self.output_format == "parquet":
-            try:
-                self.logger.debug(f"Attempting to write Parquet data to {self.local_file_path}")
-                with open(self.local_file_path, 'wb') as f:
-                    df.to_parquet(f, index=False, engine='pyarrow')
-                self.logger.info(f"Successfully wrote Parquet data to {self.local_file_path}. File size: {os.path.getsize(self.local_file_path)} bytes.") # NEW LOG
-            except Exception as e:
-                self.logger.error(f"Error writing Parquet file {self.local_file_path}: {e}", exc_info=True) # Add exc_info
-                raise
-        elif self.output_format == "jsonl":
-            try:
-                self.logger.debug(f"Attempting to write JSONL data to {self.local_file_path}")
-                with open(self.local_file_path, 'w', encoding='utf-8') as f:
-                    for record_item in self.records_buffer: # Renamed to avoid conflict
-                        import json
-                        f.write(json.dumps(record_item) + '\n')
-                self.logger.info(f"Successfully wrote JSONL data to {self.local_file_path}. File size: {os.path.getsize(self.local_file_path)} bytes.") # NEW LOG
-            except Exception as e:
-                self.logger.error(f"Error writing JSONL file {self.local_file_path}: {e}", exc_info=True) # Add exc_info
-                raise
-        
+
+        elif self.output_format == "csv":
+            # For CSV, the single local file (self.local_file_path_template) is uploaded here
+            if self.local_file_path_template and os.path.exists(self.local_file_path_template):
+                self.logger.info(f"Uploading CSV file {self.local_file_path_template} to {self.blob_path_template}")
+                try:
+                    blob_client_csv = self.container_client.get_blob_client(blob=self.blob_path_template)
+                    with open(self.local_file_path_template, "rb") as data:
+                        blob_client_csv.upload_blob(data, overwrite=True)
+                    self.logger.info(f"Successfully uploaded CSV {self.blob_path_template}")
+                except Exception as e:
+                    self.logger.error(f"Failed to upload CSV {self.blob_path_template}: {e}", exc_info=True)
+                    raise
+                finally:
+                    try:
+                        os.remove(self.local_file_path_template)
+                        self.logger.debug(f"Removed local CSV file: {self.local_file_path_template}")
+                    except Exception as e_rem:
+                        self.logger.error(f"Error removing local CSV file {self.local_file_path_template}: {e_rem}")
+            else:
+                self.logger.info(f"No CSV data to upload for {self.stream_name} (local file: {self.local_file_path_template}).")
+                # Optionally create an empty marker for CSV too if desired
+                # blob_client_csv = self.container_client.get_blob_client(blob=self.blob_path_template)
+                # blob_client_csv.upload_blob(b"", overwrite=True)
+                # self.logger.info(f"Uploaded empty marker CSV file for {self.stream_name}")
+
+
+        self.logger.info(f"Successfully cleaned up stream for {self.stream_name}")
+        # Reset for potential reuse if the sink instance is long-lived (though typically not for CLI runs)
+        self.stream_initialized = False
         self.records_buffer = []
-
-
-    def clean_up(self) -> None:
-        self.logger.info(f"Starting clean_up for stream {self.stream_name}. Stream initialized: {self.stream_initialized}. Local file path: {self.local_file_path}. Output format: {self.output_format}") # NEW LOG
-
-        if not self.stream_initialized:
-            self.logger.warning(f"Stream {self.stream_name} was not initialized. Skipping clean_up actions.")
-            return
-
-        if self.output_format in ["parquet", "jsonl"]:
-            self.logger.debug("Calling finalize_buffered_data()")
-            self.finalize_buffered_data()
-            self.logger.debug("Returned from finalize_buffered_data()")
-
-
-        if not self.local_file_path:
-            self.logger.error("local_file_path is None during clean_up after finalize_buffered_data. This should not happen.")
-            return
-
-        self.logger.info(f"Post finalize_buffered_data: Checking existence of local file: {self.local_file_path}") # NEW LOG
-
-        try:
-            if not os.path.exists(self.local_file_path):
-                self.logger.warning(f"Local file {self.local_file_path} does not exist after finalize_buffered_data. Skipping upload for {self.blob_path}.")
-                return
-            
-            file_size = os.path.getsize(self.local_file_path)
-            if file_size == 0:
-                self.logger.info(f"Local file {self.local_file_path} is empty (0 bytes). Proceeding with upload of empty file to {self.blob_path}.")
-                # Decide if you want to upload genuinely empty files or skip.
-                # For now, let's upload it.
-            else:
-                self.logger.info(f"Local file {self.local_file_path} exists. Size: {file_size} bytes.")
-
-
-            self.logger.debug(f"Preparing to upload {self.local_file_path} (as {self.output_format.upper()}) to Azure Blob Storage path: {self.blob_path}")
-            with open(self.local_file_path, "rb") as data:
-                self.blob_client.upload_blob(data, overwrite=True) # Ensure self.blob_client is valid
-            self.logger.info(f"Successfully uploaded {self.blob_path} to Azure Blob Storage")
-        except Exception as e:
-            self.logger.error(f"Failed during upload or pre-upload check for {self.blob_path}: {e}", exc_info=True) # Add exc_info
-            # Decide on re-raise. If clean_up is the very last step, maybe just log.
-            # If the SDK expects clean_up to raise on failure, then do:
-            # raise
-        finally:
-            # ... (cleanup of local file)
-            if self.local_file_path and os.path.exists(self.local_file_path):
-                try:
-                    os.remove(self.local_file_path)
-                    self.logger.debug(f"Removed local file: {self.local_file_path}")
-                except Exception as e:
-                    self.logger.error(f"Error removing local file {self.local_file_path}: {e}", exc_info=True)
-
-    def finalize(self) -> None:
-        """Upload the local file to Azure Blob Storage and remove it."""
-        self.logger.info(f"Finalizing stream for {self.stream_name}")
-
-        if not self.stream_initialized:
-            self.logger.info(f"Stream {self.stream_name} was not initialized (e.g. no records). Skipping finalize.")
-            return
-
-        # If data was buffered (Parquet/JSONL), write it to local file now
-        if self.output_format in ["parquet", "jsonl"]:
-            self.finalize_buffered_data()
-
-        if not self.local_file_path: # Should be set in start_stream
-            self.logger.error("local_file_path is None during finalize.")
-            return
-
-        self.logger.debug(f"Preparing to upload {self.local_file_path} (as {self.output_format.upper()}) to Azure Blob Storage path: {self.blob_path}")
-
-        try:
-            if not os.path.exists(self.local_file_path) or os.path.getsize(self.local_file_path) == 0:
-                if not self.records_buffer: # If buffer was also empty and file is empty/non-existent
-                     self.logger.info(f"Local file {self.local_file_path} is empty or does not exist, and no records were buffered. Skipping upload for {self.blob_path}.")
-                     # Optionally, create an empty blob to represent an empty extract
-                     # self.blob_client.upload_blob(b"", overwrite=True)
-                     # self.logger.info(f"Uploaded empty blob to {self.blob_path} to signify no data.")
-                     return # Don't try to upload a non-existent or truly empty file unless intended
-                # If buffer was processed but file is still empty, it's an issue.
-                # The finalize_buffered_data should handle creating an empty file if needed.
-
-
-            with open(self.local_file_path, "rb") as data: # Always read as binary for upload
-                self.blob_client.upload_blob(data, overwrite=True)
-            self.logger.info(f"Successfully uploaded {self.blob_path} to Azure Blob Storage")
-        except Exception as e:
-            self.logger.error(f"Failed to upload {self.blob_path} to Azure Blob Storage: {e}")
-            # Do not re-raise here if atexit is used, as it can mask other issues
-            # Let atexit handler complete. If this is critical, consider removing atexit
-            # and ensuring finalize is called explicitly by the SDK's lifecycle.
-            # For now, just log it. If part of SDK's clean_up, then re-raising is fine.
-            # Given it's an atexit, let's not re-raise to avoid masking other shutdown errors.
-            # raise
-        finally:
-            if self.local_file_path and os.path.exists(self.local_file_path):
-                try:
-                    os.remove(self.local_file_path)
-                    self.logger.debug(f"Removed local file: {self.local_file_path}")
-                except Exception as e:
-                    self.logger.error(f"Error removing local file {self.local_file_path}: {e}")
-            # else: # This log can be noisy if file was intentionally not created (e.g. no records)
-            #     self.logger.warning(f"Local file not found during cleanup: {self.local_file_path}")
-
-        self.logger.info(f"Successfully finalized stream for {self.stream_name}")
-
-# Main execution block (if run as script) - usually not needed when used as a library/plugin
-# if __name__ == "__main__":
-#     TargetAzureBlobSink.cli()
+        self.batch_file_counter = 0
