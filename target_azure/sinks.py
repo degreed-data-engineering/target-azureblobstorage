@@ -70,7 +70,7 @@ class TargetAzureBlobSink(RecordSink):
         singer_types = singer_type_def.get("type", ["null", "string"])
         
         if "number" in singer_types:
-                return pyarrow.decimal128(self.DEFAULT_DECIMAL_PRECISION, self.DEFAULT_DECIMAL_SCALE)
+            return pyarrow.decimal128(self.DEFAULT_DECIMAL_PRECISION, self.DEFAULT_DECIMAL_SCALE)
         elif "integer" in singer_types:
             return pyarrow.int64()
         elif "boolean" in singer_types:
@@ -84,15 +84,14 @@ class TargetAzureBlobSink(RecordSink):
             return pyarrow.string()
         elif "array" in singer_types:
             item_type_def = singer_type_def.get("items", {})
-            pa_item_type = self._singer_type_to_pyarrow_type(item_type_def, f"{property_name}_items")
-            if pa_item_type:
-                return pyarrow.list_(pa_item_type)
-            # self.logger.warning(f"Could not determine item type for array '{property_name}'. Defaulting array items to string.") # Commented out
+            if isinstance(item_type_def, dict):
+                pa_item_type = self._singer_type_to_pyarrow_type(item_type_def, f"{property_name}_items")
+                if pa_item_type:
+                    return pyarrow.list_(pa_item_type)
             return pyarrow.list_(pyarrow.string())
         elif "object" in singer_types:
-            return pyarrow.string()
+            return pyarrow.string() 
 
-        # self.logger.warning(f"Unknown Singer type(s) {singer_types} for property '{property_name}'. Defaulting to string.") # Commented out
         return pyarrow.string()
 
     def _build_pyarrow_schema(self) -> Optional[pyarrow.Schema]:
@@ -120,6 +119,8 @@ class TargetAzureBlobSink(RecordSink):
 
     def start_stream(self, context: Dict[str, Any]) -> None:
         self.logger.info(f"Starting stream for {self.stream_name}")
+        self._pyarrow_schema = None 
+        
         account_name = self.config["storage_account_name"]
         account_key = self.config["storage_account_key"]
         container_name = self.config.get("container_name", "default-container")
@@ -149,8 +150,7 @@ class TargetAzureBlobSink(RecordSink):
         self.output_format = self.get_output_format_from_filename(self.blob_path_template)
 
         if self.output_format == "parquet":
-            self._pyarrow_schema = self._build_pyarrow_schema()
-            if not self._pyarrow_schema:
+            if not self._build_pyarrow_schema(): 
                 msg = f"Failed to build PyArrow schema for Parquet output on stream {self.stream_name}. Cannot proceed."
                 self.logger.critical(msg)
                 raise ValueError(msg)
@@ -181,7 +181,7 @@ class TargetAzureBlobSink(RecordSink):
             try:
                 if pyarrow.types.is_decimal(pa_type):
                     str_val = str(raw_value).strip()
-                    if not str_val: # Handle empty string as None
+                    if not str_val:
                         coerced_record[col_name] = None
                     else:
                         try:
@@ -191,15 +191,10 @@ class TargetAzureBlobSink(RecordSink):
                             coerced_decimal = original_decimal.quantize(quantizer, rounding=ROUND_HALF_UP)
                             coerced_record[col_name] = coerced_decimal
                         except InvalidOperation:
-                            # self.logger.warning(f"Invalid operation converting '{raw_value}' to Decimal for column '{col_name}'. Setting to None.")
                             coerced_record[col_name] = None
                 elif pyarrow.types.is_timestamp(pa_type):
-                    # Handle '0002-12-31...' by trying to parse, will become NaT if invalid
                     dt_val = pd.to_datetime(raw_value, errors='coerce', utc=False)
                     if pd.isna(dt_val):
-                        # Log for "0002..." was here, now commented out
-                        # if str(raw_value).startswith("0002"):
-                        #     self.logger.debug(f"Coerced problematic timestamp '{raw_value}' for column '{col_name}' to None.")
                         coerced_record[col_name] = None
                     else:
                         if pa_type.tz:
@@ -212,8 +207,6 @@ class TargetAzureBlobSink(RecordSink):
                 elif pyarrow.types.is_date(pa_type):
                     dt_obj = pd.to_datetime(raw_value, errors='coerce')
                     coerced_record[col_name] = dt_obj.date() if pd.notna(dt_obj) else None
-                    # if coerced_record[col_name] is None and raw_value is not None:
-                    #      pass # self.logger.warning(f"Could not parse date '{raw_value}' for column '{col_name}'. Setting to None.")
                 elif pyarrow.types.is_integer(pa_type):
                     coerced_record[col_name] = int(float(str(raw_value)))
                 elif pyarrow.types.is_floating(pa_type):
@@ -223,11 +216,27 @@ class TargetAzureBlobSink(RecordSink):
                         val_lower = raw_value.lower()
                         if val_lower in ("true", "t", "1", "yes", "y"): coerced_record[col_name] = True
                         elif val_lower in ("false", "f", "0", "no", "n"): coerced_record[col_name] = False
-                        else: 
-                            # self.logger.warning(f"Could not parse boolean string '{raw_value}' for column '{col_name}'. Setting to None.")
-                            coerced_record[col_name] = None
+                        else: coerced_record[col_name] = None
                     else:
                         coerced_record[col_name] = bool(raw_value)
+                elif pyarrow.types.is_list(pa_type):
+                    if isinstance(raw_value, list):
+                        if pyarrow.types.is_string(pa_type.value_type) or pyarrow.types.is_large_string(pa_type.value_type):
+                            coerced_list = []
+                            for item in raw_value:
+                                if isinstance(item, (dict, list)): 
+                                    coerced_list.append(json.dumps(item))
+                                elif item is not None:
+                                    coerced_list.append(str(item))
+                                else:
+                                    coerced_list.append(None)
+                            coerced_record[col_name] = coerced_list
+                        else:
+                            # For lists of other non-string types, pass through.
+                            # More robust: recursively coerce items based on pa_type.value_type.
+                            coerced_record[col_name] = raw_value 
+                    else: 
+                        coerced_record[col_name] = None 
                 elif pyarrow.types.is_string(pa_type) or pyarrow.types.is_large_string(pa_type):
                     if isinstance(raw_value, (dict, list)):
                         coerced_record[col_name] = json.dumps(raw_value)
@@ -236,15 +245,10 @@ class TargetAzureBlobSink(RecordSink):
                 else:
                     coerced_record[col_name] = raw_value
             except (ValueError, TypeError, InvalidOperation, OverflowError) as e:
-                # self.logger.warning(
-                #     f"Type coercion error for column '{col_name}' with value '{raw_value}' "
-                #     f"(expected PyArrow type {pa_type}): {e}. Setting to None."
-                # )
                 coerced_record[col_name] = None
         
         for col_name, raw_value in record.items():
             if col_name not in coerced_record:
-                # self.logger.debug(f"Column '{col_name}' found in record but not in PyArrow schema. Adding as best-effort string.") # Can be verbose
                 if isinstance(raw_value, (dict,list)):
                     try:
                         coerced_record[col_name] = json.dumps(raw_value)
@@ -258,13 +262,18 @@ class TargetAzureBlobSink(RecordSink):
 
     def process_record(self, record: Dict[str, Any], context: Dict[str, Any]) -> None:
         if not self.stream_initialized:
-            self.logger.warning("Stream not initialized in process_record, attempting to initialize.")
-            self.start_stream(context)
+            self.logger.warning(f"Stream {self.stream_name} not initialized in process_record, attempting to initialize. This is unexpected.")
+            self.start_stream(context) 
 
-        if self.output_format == "parquet" and self._pyarrow_schema:
+        if self.output_format == "parquet":
+            if not self._pyarrow_schema:
+                self.logger.error(f"PyArrow schema missing for stream {self.stream_name} in process_record. Rebuilding.")
+                if not self._build_pyarrow_schema():
+                    self.logger.critical(f"Could not build PyArrow schema for {self.stream_name} on the fly. Record processing aborted for this stream.")
+                    return 
             processed_record = self._coerce_record_to_schema(record, self._pyarrow_schema)
             self.records_buffer.append(processed_record)
-        else:
+        else: 
             self.records_buffer.append(record)
 
         if len(self.records_buffer) >= self.batch_size_rows:
@@ -286,26 +295,24 @@ class TargetAzureBlobSink(RecordSink):
 
             if self.output_format == "parquet":
                 if not self._pyarrow_schema:
-                    self.logger.error(f"PyArrow schema is None in _drain_batch for Parquet on stream {self.stream_name}. This indicates an earlier failure.")
-                    self._pyarrow_schema = self._build_pyarrow_schema()
-                    if not self._pyarrow_schema:
-                         raise ValueError(f"Cannot write Parquet for {self.stream_name} without a PyArrow schema.")
+                     raise ValueError(f"Parquet schema not built for stream {self.stream_name} before drain.")
 
                 data_for_arrow = {}
+                df_cols = df.columns
                 for field in self._pyarrow_schema:
-                    if field.name in df.columns:
-                        data_for_arrow[field.name] = df[field.name]
+                    col_name = field.name
+                    if col_name in df_cols:
+                        data_for_arrow[col_name] = df[col_name]
                     else:
-                        # self.logger.debug(f"Column '{field.name}' from schema not in DataFrame batch for {self.stream_name}. Adding as nulls.") # Can be verbose
                         pd_dtype = 'object'
                         if pyarrow.types.is_timestamp(field.type): pd_dtype = 'datetime64[ns]'
                         elif pyarrow.types.is_boolean(field.type): pd_dtype = 'boolean'
                         elif pyarrow.types.is_integer(field.type): pd_dtype = 'Int64'
                         elif pyarrow.types.is_floating(field.type) or pyarrow.types.is_decimal(field.type): pd_dtype = 'float64'
-                        data_for_arrow[field.name] = pd.Series([None] * len(df), dtype=pd_dtype, name=field.name)
-                
+                        data_for_arrow[col_name] = pd.Series([None] * len(df), dtype=pd_dtype, name=col_name)
+
                 df_aligned = pd.DataFrame(data_for_arrow, columns=[field.name for field in self._pyarrow_schema])
-                
+
                 arrow_table = pyarrow.Table.from_pandas(df_aligned, schema=self._pyarrow_schema, safe=True, preserve_index=False)
                 with open(current_local_batch_file, 'wb') as f:
                     pq.write_table(arrow_table, f)
@@ -416,7 +423,8 @@ class TargetAzureBlobSink(RecordSink):
             finally:
                 if os.path.exists(current_local_batch_file):
                     try: os.remove(current_local_batch_file)
-                    except: pass
+                    except Exception as e_rem_empty: 
+                        self.logger.error(f"Error removing empty local file {current_local_batch_file}: {e_rem_empty}")
         
         self.logger.info(f"Successfully cleaned up stream for {self.stream_name}")
         self.stream_initialized = False
