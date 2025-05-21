@@ -1,40 +1,126 @@
 import os
 import pandas as pd
 from singer_sdk.sinks import RecordSink
-from azure.storage.blob import BlobServiceClient # Removed BlobClient as get_blob_client returns it
+from azure.storage.blob import BlobServiceClient
 import re
 import logging
 import pyarrow
+import pyarrow.parquet as pq
+import pyarrow.types 
+import json
 from azure.core.exceptions import ResourceExistsError
-from datetime import datetime
-# import atexit
+from datetime import datetime, date 
+import uuid
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP 
+from typing import Optional, Union, Dict, Any 
+
+logger = logging.getLogger(__name__)
 
 class TargetAzureBlobSink(RecordSink):
-    """Azure Storage target sink class for streaming."""
+    """Azure Storage target sink class for streaming with batching."""
+
+    DEFAULT_BATCH_SIZE_ROWS = 10000
+    DEFAULT_DECIMAL_PRECISION = 38 
+    DEFAULT_DECIMAL_SCALE = 9      
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.blob_service_client = None
-        self.container_client = None
-        self.blob_client = None
-        self.local_file_path = None
-        self.stream_initialized = False
-        self.output_format = "csv" # Default output format
-        self.logger.setLevel(logging.DEBUG)
-        # atexit.register(self.finalize) # Be careful with atexit in long-running or complex apps
+        self.blob_service_client: Optional[BlobServiceClient] = None
+        self.container_client: Optional[Any] = None
+        self.local_file_path_template: Optional[str] = None
+        self.blob_path_template: Optional[str] = None
+        self.stream_initialized: bool = False
+        self.output_format: str = "csv"
+        self.records_buffer: list = []
+        self.batch_file_counter: int = 0
+        self._pyarrow_schema: Optional[pyarrow.Schema] = None
+
+    @property
+    def batch_size_rows(self) -> int:
+        return int(self.config.get("batch_size_rows", self.DEFAULT_BATCH_SIZE_ROWS))
 
     def get_output_format_from_filename(self, filename: str) -> str:
-        """Determines the output format based on the file extension."""
         if filename.lower().endswith(".parquet"):
             return "parquet"
-        elif filename.lower().endswith(".jsonl") or filename.lower().endswith(".json"): # Treat .json as jsonl for simplicity here
+        elif filename.lower().endswith(".jsonl") or filename.lower().endswith(".json"):
             return "jsonl"
-        # Add other formats like .json if you want to support standard JSON arrays later
-        return "csv" # Default to CSV
+        return "csv"
 
-    def start_stream(self) -> None:
-        """Initialize the stream."""
+    def _generate_batch_suffix(self) -> str:
+        return f"part_{self.batch_file_counter:04d}_{uuid.uuid4().hex[:8]}"
+
+    def _get_batch_blob_path(self) -> str:
+        if self.output_format == "csv":
+            return self.blob_path_template or ""
+        
+        if not self.blob_path_template:
+             self.logger.error("blob_path_template is not set in _get_batch_blob_path")
+             return f"{self.stream_name}/error_unknown_path_{self._generate_batch_suffix()}.{self.output_format}"
+
+        base_path, extension = os.path.splitext(self.blob_path_template)
+        batch_suffix = self._generate_batch_suffix()
+        return f"{base_path}_{batch_suffix}{extension}"
+
+    def _get_batch_local_file_path(self, batch_blob_path: str) -> str:
+        stream_tmp_dir = os.path.join("/tmp", f"target_azure_{self.stream_name}")
+        os.makedirs(stream_tmp_dir, exist_ok=True)
+        return os.path.join(stream_tmp_dir, os.path.basename(batch_blob_path))
+
+    def _singer_type_to_pyarrow_type(self, singer_type_def: Dict[str, Any], property_name: str) -> Optional[pyarrow.DataType]:
+        singer_types = singer_type_def.get("type", ["null", "string"])
+        
+        if "number" in singer_types:
+            return pyarrow.decimal128(self.DEFAULT_DECIMAL_PRECISION, self.DEFAULT_DECIMAL_SCALE)
+        elif "integer" in singer_types:
+            return pyarrow.int64()
+        elif "boolean" in singer_types:
+            return pyarrow.bool_()
+        elif "string" in singer_types:
+            fmt = singer_type_def.get("format")
+            if fmt == "date-time":
+                return pyarrow.timestamp('us', tz='UTC')
+            elif fmt == "date":
+                return pyarrow.date32()
+            return pyarrow.string()
+        elif "array" in singer_types:
+            item_type_def = singer_type_def.get("items", {})
+            if isinstance(item_type_def, dict):
+                pa_item_type = self._singer_type_to_pyarrow_type(item_type_def, f"{property_name}_items")
+                if pa_item_type:
+                    return pyarrow.list_(pa_item_type)
+            return pyarrow.list_(pyarrow.string())
+        elif "object" in singer_types:
+            return pyarrow.string() 
+
+        return pyarrow.string()
+
+    def _build_pyarrow_schema(self) -> Optional[pyarrow.Schema]:
+        if self._pyarrow_schema:
+            return self._pyarrow_schema
+
+        if not self.schema:
+            self.logger.error(f"Singer schema (self.schema) not available for stream {self.stream_name}.")
+            return None
+
+        fields = []
+        for property_name, property_definition in self.schema.get("properties", {}).items():
+            pa_type = self._singer_type_to_pyarrow_type(property_definition, property_name)
+            if pa_type:
+                is_nullable = "null" in property_definition.get("type", [])
+                fields.append(pyarrow.field(property_name, pa_type, nullable=is_nullable))
+        
+        if not fields:
+            self.logger.warning(f"No fields derived for PyArrow schema for stream {self.stream_name}.")
+            return None
+        
+        self._pyarrow_schema = pyarrow.schema(fields)
+        self.logger.info(f"Built PyArrow schema for {self.stream_name}: {self._pyarrow_schema}")
+        return self._pyarrow_schema
+
+    def start_stream(self, context: Dict[str, Any]) -> None:
         self.logger.info(f"Starting stream for {self.stream_name}")
+        self._pyarrow_schema = None 
+        
         account_name = self.config["storage_account_name"]
         account_key = self.config["storage_account_key"]
         container_name = self.config.get("container_name", "default-container")
@@ -44,255 +130,304 @@ class TargetAzureBlobSink(RecordSink):
         )
 
         self.blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-        self.container_client = self.blob_service_client.get_container_client(container_name)
+        if self.blob_service_client:
+            self.container_client = self.blob_service_client.get_container_client(container_name)
+        else:
+            self.logger.critical("Failed to create BlobServiceClient.")
+            raise ConnectionError("Failed to create BlobServiceClient.")
 
         try:
-            self.container_client.create_container()
-            self.logger.info(f"Created container: {container_name}")
+            if self.container_client:
+                self.container_client.create_container()
+                self.logger.info(f"Created container: {container_name}")
         except ResourceExistsError:
             self.logger.info(f"Container {container_name} already exists.")
+        except Exception as e:
+            self.logger.error(f"Failed to create or access container {container_name}: {e}", exc_info=True)
+            raise
 
-        file_name_with_path = self.format_file_name() # This now includes the full desired blob path
-        self.output_format = self.get_output_format_from_filename(file_name_with_path)
-
-        self.blob_path = file_name_with_path # format_file_name now returns the full path
-        self.local_file_path = os.path.join("/tmp", os.path.basename(file_name_with_path)) # Use only basename for local temp file
-        os.makedirs(os.path.dirname(self.local_file_path), exist_ok=True)
-
-        # For Parquet, we don't create an empty file initially like for CSV appending.
-        # For JSONL, we also don't need an empty file to start, each line is a new object.
-        # For CSV, the original logic is fine.
-        if self.output_format == "csv":
-            if not os.path.exists(self.local_file_path):
-                with open(self.local_file_path, 'w') as f: # For CSV, ensure it's writable text mode
-                    f.write('')
-        elif os.path.exists(self.local_file_path): # If not CSV and file exists from previous run (should not happen with /tmp typically)
-            os.remove(self.local_file_path)
-
-        self.blob_client = self.container_client.get_blob_client(blob=self.blob_path)
-        self.logger.debug(f"Initialized blob client for: {self.blob_path}. Output format: {self.output_format.upper()}")
-        self.stream_initialized = True
-        self.records_buffer = [] # Buffer records for Parquet/JSONL
-
-    def process_record(self, record: dict, context: dict) -> None:
-        """Process and write the record."""
-        if not self.stream_initialized:
-            self.start_stream()
-
-
-        if self.output_format == "csv":
-            df = pd.DataFrame([record])
-            header = not os.path.exists(self.local_file_path) or os.path.getsize(self.local_file_path) == 0
-            # Open in append text mode for CSV
-            with open(self.local_file_path, 'a', newline='', encoding='utf-8') as f:
-                df.to_csv(f, index=False, header=header)
-
-        else:
-            # For Parquet and JSONL, buffer records and write in batches (or at the end)
-            self.records_buffer.append(record)
-
-
-    def format_file_name(self) -> str:
-        """
-        Format the file name based on the context and Azure Blob Storage naming rules.
-        The naming_convention can now include path components.
-        Example: "my_subfolder/{stream}_{timestamp}.parquet"
-        """
-        # Default naming convention is now more generic until format is determined
-        naming_convention = self.config.get("naming_convention", "{stream}/data.csv")
-        stream_name = self.stream_name
-
-        # Basic timestamp for uniqueness if not in naming_convention
-        # More robust timestamping from singer_sdk.helpers._typing might be better
-        timestamp_str = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
-
-        # Simple replacement, consider more robust templating if needed
-        file_name_pattern = naming_convention.replace("{stream}", stream_name)
-        file_name_pattern = file_name_pattern.replace("{timestamp}", timestamp_str)
-        # Add other placeholders like {date}, {time} if you have them
-
-        # Replace or remove invalid characters for Azure Blob Storage (applies to path components too)
-        # This regex is a bit aggressive for path components; Azure allows '/'
-        # Let's refine it to only sanitize the actual filename part if '/' is a path separator
-        
-        # Assume '/' is a path separator and should not be sanitized
-        # Sanitize each component if you want to be super careful, or just the basename
-        # For simplicity, we'll sanitize the whole thing but this might mangle desired subfolders
-        # if they contain invalid chars. Better to ensure naming_convention is clean.
-        # A more robust way would be to split by '/', sanitize each part except the last,
-        # then sanitize the last part (filename).
-        
-        # Simplified: User must ensure path in naming_convention is valid. Sanitize only filename chars.
-        path_parts = file_name_pattern.split('/')
-        sanitized_parts = []
-        for i, part in enumerate(path_parts):
-            if i == len(path_parts) - 1: # Last part is the filename
-                 # Replace invalid characters for the filename part
-                sanitized_parts.append(re.sub(r'[\\*?:"<>|]', "_", part))
-            else: # Path components
-                # Path components can have different rules, but let's be safe
-                # Azure allows most chars in paths, but let's avoid these common ones too.
-                sanitized_parts.append(re.sub(r'[\\*?:"<>|]', "_", part))
-        
-        final_path = "/".join(sanitized_parts)
-
-        self.logger.debug(f"Formatted file name/path: {final_path}")
-        return final_path
-
-    def finalize_buffered_data(self):
-        """Writes buffered data to local file for Parquet or JSONL."""
-        self.logger.info(f"Entering finalize_buffered_data. Record count: {len(self.records_buffer)}. Local file path: {self.local_file_path}") # NEW LOG
-
-        if not self.records_buffer:
-            self.logger.info(f"No records buffered for {self.stream_name}, attempting to write empty file to {self.local_file_path}.")
-            if not os.path.exists(self.local_file_path):
-                 with open(self.local_file_path, 'wb') as f:
-                    if self.output_format == "parquet":
-                        self.logger.debug(f"Writing empty schema-only parquet file to {self.local_file_path}.")
-                        # Create an empty DataFrame WITH SCHEMA if possible, else just empty
-                        # schema_cols = list(self.schema["properties"].keys()) if self.schema and "properties" in self.schema else []
-                        # df_empty = pd.DataFrame(columns=schema_cols)
-                        df_empty = pd.DataFrame() # Simplest empty Parquet
-                        df_empty.to_parquet(f, index=False, engine='pyarrow')
-                    elif self.output_format == "jsonl":
-                         self.logger.debug(f"Writing empty JSONL file to {self.local_file_path}.")
-                         pass # Empty file is fine
-            else:
-                self.logger.info(f"Local file {self.local_file_path} already exists (empty records case). Doing nothing to it here.")
-            return
-
-        # If records were buffered:
-        df = pd.DataFrame(self.records_buffer) # This line could fail if records_buffer contains problematic data for DataFrame creation
-        self.logger.info(f"Writing {len(self.records_buffer)} buffered records to {self.local_file_path} as {self.output_format.upper()}")
+        self.blob_path_template = self.format_file_name()
+        self.output_format = self.get_output_format_from_filename(self.blob_path_template)
 
         if self.output_format == "parquet":
-            try:
-                self.logger.debug(f"Attempting to write Parquet data to {self.local_file_path}")
-                with open(self.local_file_path, 'wb') as f:
-                    df.to_parquet(f, index=False, engine='pyarrow')
-                self.logger.info(f"Successfully wrote Parquet data to {self.local_file_path}. File size: {os.path.getsize(self.local_file_path)} bytes.") # NEW LOG
-            except Exception as e:
-                self.logger.error(f"Error writing Parquet file {self.local_file_path}: {e}", exc_info=True) # Add exc_info
-                raise
-        elif self.output_format == "jsonl":
-            try:
-                self.logger.debug(f"Attempting to write JSONL data to {self.local_file_path}")
-                with open(self.local_file_path, 'w', encoding='utf-8') as f:
-                    for record_item in self.records_buffer: # Renamed to avoid conflict
-                        import json
-                        f.write(json.dumps(record_item) + '\n')
-                self.logger.info(f"Successfully wrote JSONL data to {self.local_file_path}. File size: {os.path.getsize(self.local_file_path)} bytes.") # NEW LOG
-            except Exception as e:
-                self.logger.error(f"Error writing JSONL file {self.local_file_path}: {e}", exc_info=True) # Add exc_info
-                raise
-        
-        self.records_buffer = []
+            if not self._build_pyarrow_schema(): 
+                msg = f"Failed to build PyArrow schema for Parquet output on stream {self.stream_name}. Cannot proceed."
+                self.logger.critical(msg)
+                raise ValueError(msg)
 
+        if self.output_format == "csv":
+            self.local_file_path_template = os.path.join("/tmp", os.path.basename(self.blob_path_template))
+            os.makedirs(os.path.dirname(self.local_file_path_template), exist_ok=True)
+            if not os.path.exists(self.local_file_path_template):
+                with open(self.local_file_path_template, 'w', encoding='utf-8') as f:
+                    f.write('')
+        
+        self.logger.debug(f"Stream {self.stream_name} initialized. Output format: {self.output_format.upper()}. Batch size: {self.batch_size_rows} rows.")
+        self.stream_initialized = True
+        self.records_buffer = []
+        self.batch_file_counter = 0
+
+    def _coerce_record_to_schema(self, record: Dict[str, Any], pa_schema: pyarrow.Schema) -> Dict[str, Any]:
+        coerced_record: Dict[str, Any] = {}
+        for field in pa_schema:
+            col_name = field.name
+            pa_type = field.type
+            raw_value = record.get(col_name)
+
+            if raw_value is None:
+                coerced_record[col_name] = None
+                continue
+
+            try:
+                if pyarrow.types.is_decimal(pa_type):
+                    str_val = str(raw_value).strip()
+                    if not str_val:
+                        coerced_record[col_name] = None
+                    else:
+                        try:
+                            original_decimal = Decimal(str_val)
+                            target_scale = pa_type.scale 
+                            quantizer = Decimal('1e-' + str(target_scale))
+                            coerced_decimal = original_decimal.quantize(quantizer, rounding=ROUND_HALF_UP)
+                            coerced_record[col_name] = coerced_decimal
+                        except InvalidOperation:
+                            coerced_record[col_name] = None
+                elif pyarrow.types.is_timestamp(pa_type):
+                    dt_val = pd.to_datetime(raw_value, errors='coerce', utc=False)
+                    if pd.isna(dt_val):
+                        coerced_record[col_name] = None
+                    else:
+                        if pa_type.tz:
+                             if dt_val.tzinfo is None:
+                                 coerced_record[col_name] = dt_val.tz_localize(pa_type.tz)
+                             else:
+                                 coerced_record[col_name] = dt_val.tz_convert(pa_type.tz)
+                        else:
+                             coerced_record[col_name] = dt_val.tz_localize(None) if dt_val.tzinfo else dt_val
+                elif pyarrow.types.is_date(pa_type):
+                    dt_obj = pd.to_datetime(raw_value, errors='coerce')
+                    coerced_record[col_name] = dt_obj.date() if pd.notna(dt_obj) else None
+                elif pyarrow.types.is_integer(pa_type):
+                    coerced_record[col_name] = int(float(str(raw_value)))
+                elif pyarrow.types.is_floating(pa_type):
+                    coerced_record[col_name] = float(str(raw_value))
+                elif pyarrow.types.is_boolean(pa_type):
+                    if isinstance(raw_value, str):
+                        val_lower = raw_value.lower()
+                        if val_lower in ("true", "t", "1", "yes", "y"): coerced_record[col_name] = True
+                        elif val_lower in ("false", "f", "0", "no", "n"): coerced_record[col_name] = False
+                        else: coerced_record[col_name] = None
+                    else:
+                        coerced_record[col_name] = bool(raw_value)
+                elif pyarrow.types.is_list(pa_type):
+                    if isinstance(raw_value, list):
+                        if pyarrow.types.is_string(pa_type.value_type) or pyarrow.types.is_large_string(pa_type.value_type):
+                            coerced_list = []
+                            for item in raw_value:
+                                if isinstance(item, (dict, list)): 
+                                    coerced_list.append(json.dumps(item))
+                                elif item is not None:
+                                    coerced_list.append(str(item))
+                                else:
+                                    coerced_list.append(None)
+                            coerced_record[col_name] = coerced_list
+                        else:
+                            # For lists of other non-string types, pass through.
+                            # More robust: recursively coerce items based on pa_type.value_type.
+                            coerced_record[col_name] = raw_value 
+                    else: 
+                        coerced_record[col_name] = None 
+                elif pyarrow.types.is_string(pa_type) or pyarrow.types.is_large_string(pa_type):
+                    if isinstance(raw_value, (dict, list)):
+                        coerced_record[col_name] = json.dumps(raw_value)
+                    else:
+                        coerced_record[col_name] = str(raw_value)
+                else:
+                    coerced_record[col_name] = raw_value
+            except (ValueError, TypeError, InvalidOperation, OverflowError) as e:
+                coerced_record[col_name] = None
+        
+        for col_name, raw_value in record.items():
+            if col_name not in coerced_record:
+                if isinstance(raw_value, (dict,list)):
+                    try:
+                        coerced_record[col_name] = json.dumps(raw_value)
+                    except TypeError:
+                        coerced_record[col_name] = str(raw_value)
+                elif raw_value is not None:
+                    coerced_record[col_name] = str(raw_value)
+                else:
+                    coerced_record[col_name] = None
+        return coerced_record
+
+    def process_record(self, record: Dict[str, Any], context: Dict[str, Any]) -> None:
+        if not self.stream_initialized:
+            self.logger.warning(f"Stream {self.stream_name} not initialized in process_record, attempting to initialize. This is unexpected.")
+            self.start_stream(context) 
+
+        if self.output_format == "parquet":
+            if not self._pyarrow_schema:
+                self.logger.error(f"PyArrow schema missing for stream {self.stream_name} in process_record. Rebuilding.")
+                if not self._build_pyarrow_schema():
+                    self.logger.critical(f"Could not build PyArrow schema for {self.stream_name} on the fly. Record processing aborted for this stream.")
+                    return 
+            processed_record = self._coerce_record_to_schema(record, self._pyarrow_schema)
+            self.records_buffer.append(processed_record)
+        else: 
+            self.records_buffer.append(record)
+
+        if len(self.records_buffer) >= self.batch_size_rows:
+            self.logger.info(f"Buffer for {self.stream_name} ({self.output_format}) reached {len(self.records_buffer)} records. Draining batch.")
+            self._drain_batch()
+
+    def _drain_batch(self) -> None:
+        if not self.records_buffer:
+            self.logger.debug(f"No records in buffer for {self.stream_name}, skipping batch drain.")
+            return
+
+        current_batch_blob_path = self._get_batch_blob_path()
+        current_local_batch_file = self._get_batch_local_file_path(current_batch_blob_path)
+        
+        self.logger.info(f"Draining {len(self.records_buffer)} records for {self.stream_name} to local file {current_local_batch_file} for blob {current_batch_blob_path}")
+
+        try:
+            df = pd.DataFrame(self.records_buffer)
+
+            if self.output_format == "parquet":
+                if not self._pyarrow_schema:
+                     raise ValueError(f"Parquet schema not built for stream {self.stream_name} before drain.")
+
+                data_for_arrow = {}
+                df_cols = df.columns
+                for field in self._pyarrow_schema:
+                    col_name = field.name
+                    if col_name in df_cols:
+                        data_for_arrow[col_name] = df[col_name]
+                    else:
+                        pd_dtype = 'object'
+                        if pyarrow.types.is_timestamp(field.type): pd_dtype = 'datetime64[ns]'
+                        elif pyarrow.types.is_boolean(field.type): pd_dtype = 'boolean'
+                        elif pyarrow.types.is_integer(field.type): pd_dtype = 'Int64'
+                        elif pyarrow.types.is_floating(field.type) or pyarrow.types.is_decimal(field.type): pd_dtype = 'float64'
+                        data_for_arrow[col_name] = pd.Series([None] * len(df), dtype=pd_dtype, name=col_name)
+
+                df_aligned = pd.DataFrame(data_for_arrow, columns=[field.name for field in self._pyarrow_schema])
+
+                arrow_table = pyarrow.Table.from_pandas(df_aligned, schema=self._pyarrow_schema, safe=True, preserve_index=False)
+                with open(current_local_batch_file, 'wb') as f:
+                    pq.write_table(arrow_table, f)
+
+            elif self.output_format == "jsonl":
+                with open(current_local_batch_file, 'w', encoding='utf-8') as f:
+                    for rec in self.records_buffer:
+                        f.write(json.dumps(self._serialize_json_safe(rec)) + '\n')
+            
+            elif self.output_format == "csv":
+                is_first_batch_file = self.batch_file_counter == 0
+                df.to_csv(current_local_batch_file, index=False, header=is_first_batch_file, encoding='utf-8', lineterminator='\n')
+
+            file_size = os.path.getsize(current_local_batch_file)
+            self.logger.info(f"Successfully wrote batch to {current_local_batch_file}. Size: {file_size} bytes. Uploading to {current_batch_blob_path}.")
+
+            if self.container_client:
+                blob_client_for_batch = self.container_client.get_blob_client(blob=current_batch_blob_path)
+                with open(current_local_batch_file, "rb") as data:
+                    blob_client_for_batch.upload_blob(data, overwrite=True)
+                self.logger.info(f"Successfully uploaded batch file {current_batch_blob_path}")
+            else:
+                self.logger.error("Container client not initialized, cannot upload batch.")
+                raise ConnectionError("Azure container client not initialized.")
+
+        except Exception as e:
+            self.logger.error(f"Failed to process or upload batch for {self.stream_name} to {current_batch_blob_path}: {e}", exc_info=True)
+            raise
+        finally:
+            if os.path.exists(current_local_batch_file):
+                try:
+                    os.remove(current_local_batch_file)
+                    self.logger.debug(f"Removed local batch file: {current_local_batch_file}")
+                except Exception as e_rem:
+                    self.logger.error(f"Error removing local batch file {current_local_batch_file}: {e_rem}")
+            
+            self.records_buffer = []
+            self.batch_file_counter += 1
+
+    def _serialize_json_safe(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        safe_record: Dict[str, Any] = {}
+        for key, value in record.items():
+            if isinstance(value, (datetime, pd.Timestamp, date)):
+                safe_record[key] = value.isoformat()
+            elif isinstance(value, Decimal):
+                safe_record[key] = float(value) 
+            elif pd.isna(value):
+                safe_record[key] = None
+            else:
+                safe_record[key] = value
+        return safe_record
+
+    def format_file_name(self) -> str:
+        naming_convention = self.config.get("naming_convention", "{stream}/{stream}_{timestamp}.csv")
+        stream_name_safe = re.sub(r'[\\/*?:"<>|]', "_", self.stream_name)
+        timestamp_str = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
+        
+        file_name_pattern = naming_convention.replace("{stream}", stream_name_safe)
+        if "{timestamp}" in file_name_pattern:
+            file_name_pattern = file_name_pattern.replace("{timestamp}", timestamp_str)
+        
+        parts = file_name_pattern.split('/')
+        sanitized_parts = [re.sub(r'[\\*?:"<>|]', "_", part) for part in parts]
+        final_path = "/".join(sanitized_parts)
+        
+        self.logger.debug(f"Formatted base file name/path pattern: {final_path}")
+        return final_path
 
     def clean_up(self) -> None:
-        self.logger.info(f"Starting clean_up for stream {self.stream_name}. Stream initialized: {self.stream_initialized}. Local file path: {self.local_file_path}. Output format: {self.output_format}") # NEW LOG
-
+        self.logger.info(f"Starting clean_up for stream {self.stream_name}. Records in buffer: {len(self.records_buffer)}")
         if not self.stream_initialized:
-            self.logger.warning(f"Stream {self.stream_name} was not initialized. Skipping clean_up actions.")
+            self.logger.warning(f"Stream {self.stream_name} was not initialized. Skipping clean_up.")
             return
 
-        if self.output_format in ["parquet", "jsonl"]:
-            self.logger.debug("Calling finalize_buffered_data()")
-            self.finalize_buffered_data()
-            self.logger.debug("Returned from finalize_buffered_data()")
-
-
-        if not self.local_file_path:
-            self.logger.error("local_file_path is None during clean_up after finalize_buffered_data. This should not happen.")
-            return
-
-        self.logger.info(f"Post finalize_buffered_data: Checking existence of local file: {self.local_file_path}") # NEW LOG
-
-        try:
-            if not os.path.exists(self.local_file_path):
-                self.logger.warning(f"Local file {self.local_file_path} does not exist after finalize_buffered_data. Skipping upload for {self.blob_path}.")
-                return
-            
-            file_size = os.path.getsize(self.local_file_path)
-            if file_size == 0:
-                self.logger.info(f"Local file {self.local_file_path} is empty (0 bytes). Proceeding with upload of empty file to {self.blob_path}.")
-                # Decide if you want to upload genuinely empty files or skip.
-                # For now, let's upload it.
-            else:
-                self.logger.info(f"Local file {self.local_file_path} exists. Size: {file_size} bytes.")
-
-
-            self.logger.debug(f"Preparing to upload {self.local_file_path} (as {self.output_format.upper()}) to Azure Blob Storage path: {self.blob_path}")
-            with open(self.local_file_path, "rb") as data:
-                self.blob_client.upload_blob(data, overwrite=True) # Ensure self.blob_client is valid
-            self.logger.info(f"Successfully uploaded {self.blob_path} to Azure Blob Storage")
-        except Exception as e:
-            self.logger.error(f"Failed during upload or pre-upload check for {self.blob_path}: {e}", exc_info=True) # Add exc_info
-            # Decide on re-raise. If clean_up is the very last step, maybe just log.
-            # If the SDK expects clean_up to raise on failure, then do:
-            # raise
-        finally:
-            # ... (cleanup of local file)
-            if self.local_file_path and os.path.exists(self.local_file_path):
-                try:
-                    os.remove(self.local_file_path)
-                    self.logger.debug(f"Removed local file: {self.local_file_path}")
-                except Exception as e:
-                    self.logger.error(f"Error removing local file {self.local_file_path}: {e}", exc_info=True)
-
-    def finalize(self) -> None:
-        """Upload the local file to Azure Blob Storage and remove it."""
-        self.logger.info(f"Finalizing stream for {self.stream_name}")
-
-        if not self.stream_initialized:
-            self.logger.info(f"Stream {self.stream_name} was not initialized (e.g. no records). Skipping finalize.")
-            return
-
-        # If data was buffered (Parquet/JSONL), write it to local file now
-        if self.output_format in ["parquet", "jsonl"]:
-            self.finalize_buffered_data()
-
-        if not self.local_file_path: # Should be set in start_stream
-            self.logger.error("local_file_path is None during finalize.")
-            return
-
-        self.logger.debug(f"Preparing to upload {self.local_file_path} (as {self.output_format.upper()}) to Azure Blob Storage path: {self.blob_path}")
-
-        try:
-            if not os.path.exists(self.local_file_path) or os.path.getsize(self.local_file_path) == 0:
-                if not self.records_buffer: # If buffer was also empty and file is empty/non-existent
-                     self.logger.info(f"Local file {self.local_file_path} is empty or does not exist, and no records were buffered. Skipping upload for {self.blob_path}.")
-                     # Optionally, create an empty blob to represent an empty extract
-                     # self.blob_client.upload_blob(b"", overwrite=True)
-                     # self.logger.info(f"Uploaded empty blob to {self.blob_path} to signify no data.")
-                     return # Don't try to upload a non-existent or truly empty file unless intended
-                # If buffer was processed but file is still empty, it's an issue.
-                # The finalize_buffered_data should handle creating an empty file if needed.
-
-
-            with open(self.local_file_path, "rb") as data: # Always read as binary for upload
-                self.blob_client.upload_blob(data, overwrite=True)
-            self.logger.info(f"Successfully uploaded {self.blob_path} to Azure Blob Storage")
-        except Exception as e:
-            self.logger.error(f"Failed to upload {self.blob_path} to Azure Blob Storage: {e}")
-            # Do not re-raise here if atexit is used, as it can mask other issues
-            # Let atexit handler complete. If this is critical, consider removing atexit
-            # and ensuring finalize is called explicitly by the SDK's lifecycle.
-            # For now, just log it. If part of SDK's clean_up, then re-raising is fine.
-            # Given it's an atexit, let's not re-raise to avoid masking other shutdown errors.
-            # raise
-        finally:
-            if self.local_file_path and os.path.exists(self.local_file_path):
-                try:
-                    os.remove(self.local_file_path)
-                    self.logger.debug(f"Removed local file: {self.local_file_path}")
-                except Exception as e:
-                    self.logger.error(f"Error removing local file {self.local_file_path}: {e}")
-            # else: # This log can be noisy if file was intentionally not created (e.g. no records)
-            #     self.logger.warning(f"Local file not found during cleanup: {self.local_file_path}")
-
-        self.logger.info(f"Successfully finalized stream for {self.stream_name}")
-
-# Main execution block (if run as script) - usually not needed when used as a library/plugin
-# if __name__ == "__main__":
-#     TargetAzureBlobSink.cli()
+        if self.records_buffer:
+            self.logger.info(f"Draining remaining {len(self.records_buffer)} records for {self.stream_name} ({self.output_format}) during clean_up.")
+            self._drain_batch()
+        
+        elif self.batch_file_counter == 0: 
+            self.logger.info(f"No records processed and no batches written for {self.stream_name} ({self.output_format}). Writing an empty marker file.")
+            current_batch_blob_path = self._get_batch_blob_path() 
+            current_local_batch_file = self._get_batch_local_file_path(current_batch_blob_path)
+            try:
+                if self.output_format == "parquet":
+                    if not self._pyarrow_schema: self._pyarrow_schema = self._build_pyarrow_schema()
+                    if self._pyarrow_schema:
+                        empty_table = self._pyarrow_schema.empty_table()
+                        with open(current_local_batch_file, 'wb') as f:
+                            pq.write_table(empty_table, f)
+                    else:
+                         self.logger.warning(f"Cannot write typed empty Parquet for {self.stream_name} due to missing schema. Writing 0-byte file.")
+                         with open(current_local_batch_file, 'wb') as f: pass
+                elif self.output_format == "jsonl":
+                    with open(current_local_batch_file, 'w', encoding='utf-8') as f: pass
+                elif self.output_format == "csv":
+                    with open(current_local_batch_file, 'w', encoding='utf-8') as f:
+                        if self.schema and "properties" in self.schema:
+                            header_row = ",".join(self.schema["properties"].keys())
+                            f.write(header_row + "\n")
+                
+                if os.path.exists(current_local_batch_file) and self.container_client:
+                    blob_client_empty = self.container_client.get_blob_client(blob=current_batch_blob_path)
+                    with open(current_local_batch_file, "rb") as data:
+                        blob_client_empty.upload_blob(data, overwrite=True)
+                    self.logger.info(f"Successfully uploaded empty marker file {current_batch_blob_path}")
+            except Exception as e:
+                self.logger.error(f"Failed to create or upload empty marker file for {self.stream_name}: {e}", exc_info=True)
+            finally:
+                if os.path.exists(current_local_batch_file):
+                    try: os.remove(current_local_batch_file)
+                    except Exception as e_rem_empty: 
+                        self.logger.error(f"Error removing empty local file {current_local_batch_file}: {e_rem_empty}")
+        
+        self.logger.info(f"Successfully cleaned up stream for {self.stream_name}")
+        self.stream_initialized = False
+        self.records_buffer = []
+        self.batch_file_counter = 0
+        self._pyarrow_schema = None
