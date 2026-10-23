@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "target-azure"
-version = "0.0.1"
+version = "0.1.0"
 description = "Singer target for tap-azure, built with the Meltano Singer SDK."
 readme = "README.md"
 authors = ["Nikhil Niket <nikhil.niket@talview.com>"]
@@ -20,13 +20,13 @@ classifiers = [
 license = "Apache-2.0"
 
 [tool.poetry.dependencies]
-python = ">=3.9"
+python = ">=3.10"
 singer-sdk = { version="~=0.39.1" }
 fs-s3fs = { version = "~=1.1.1", optional = true }
 requests = "~=2.32.3"
 pandas = "^2.2.2"
 azure-storage-file-datalake = "^12.16.0"
-pyarrow = "^17.0.0"
+pyarrow = "^23.0.1"
 fsspec = "^2024.6.1"
 adlfs = "^2024.7.0"
 
